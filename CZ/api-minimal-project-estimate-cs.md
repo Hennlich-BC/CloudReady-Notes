@@ -1,6 +1,6 @@
 # Odhad minimálního projektu REST API
 
-Dokument doplňuje `api-infrastructure-cs.md`. Jde o předběžný odhad pro jednoho specialistu a osmihodinový pracovní den, nikoli o obchodní nabídku.
+Dokument doplňuje `CZ\api-infrastructure-cs.md`. Jde o předběžný odhad pro jednoho specialistu a osmihodinový pracovní den, nikoli o obchodní nabídku.
 
 ## Rozsah minimálního projektu
 
