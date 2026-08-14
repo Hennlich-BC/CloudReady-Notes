@@ -101,6 +101,8 @@ Volumes musí směřovat do samostatného datového adresáře mimo Business Cen
 
 ### Síťové schéma
 
+![Síťové schéma REST API infrastruktury](../img/schema02.png)
+
 ~~~text
 Business Central On-Prem
           │ HTTPS

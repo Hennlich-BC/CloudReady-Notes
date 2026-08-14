@@ -101,6 +101,8 @@ Volumes должны быть привязаны к отдельному кат�
 
 ### Сетевая схема
 
+![Сетевая схема инфраструктуры REST API](../img/schema02.png)
+
 ~~~text
 Business Central On-Prem
           │ HTTPS
