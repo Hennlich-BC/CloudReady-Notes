@@ -40,7 +40,7 @@ Pro production se doporučuje samostatný interní Linux server nebo Linux VM. D
 Na Linux serveru poběží:
 
 - Docker Engine a Docker Compose;
-- FastAPI a background workery;
+- FastAPI a background workery jako samostatné Docker kontejnery;
 - Typst a nástroje pro zpracování PDF;
 - RabbitMQ, PostgreSQL a podle potřeby Redis/MinIO;
 - reverse proxy, monitoring a technické logy;
@@ -53,6 +53,8 @@ Linux server musí mít statickou IP/DNS, důvěryhodný TLS certifikát, synchr
 Pro první odhad postačí 4 CPU, 8 GB RAM a samostatný disk od 100 GB; konečná velikost závisí na objemu PDF, počtu paralelních workerů a době uchování souborů. Pro production je vhodná Linux VM s podporovanou LTS distribucí, například Ubuntu Server LTS nebo Debian stable.
 
 ### Komponenty
+
+FastAPI a všechny přímo související služby jsou provozovány v Docker kontejnerech a spravovány společným souborem Docker Compose. Každá služba (`reverse-proxy`, `api`, workery, scheduler, RabbitMQ, PostgreSQL a volitelně Redis, MinIO a observability) běží ve vlastním kontejneru v privátní Docker network. Na Linux hostu se tyto aplikační služby neinstalují přímo. Navenek se publikuje pouze HTTPS port kontejneru `reverse-proxy`; interní port FastAPI a porty ostatních služeb zůstávají dostupné jen mezi kontejnery. Trvalá data jsou uložena v pojmenovaných Docker volumes, takže nejsou svázána s životním cyklem jednotlivých kontejnerů.
 
 | Služba | Technologie | Účel |
 |---|---|---|
