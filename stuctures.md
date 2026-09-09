@@ -114,3 +114,7 @@ task-service/
 ```
 
 ![structures](/img/schema03.png)
+
+
+## Business Central Integration
+![structures2](/img/mermaid-diagram.png)
