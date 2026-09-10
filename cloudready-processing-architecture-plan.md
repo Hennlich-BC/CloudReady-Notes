@@ -87,6 +87,59 @@
 //WIN-FILESRV/shared    /opt/cloudready-tasks/smb/shared    cifs  credentials=/opt/cloudready-tasks/.smbcredentials,uid=1000,gid=1000,iocharset=utf8,vers=3.0  0  0
 ```
 
+### 2.1 `ftp.yaml` — профили подключений (пример)
+
+`app/config/ftp.yaml` описывает **топологию** подключений (host/port/протокол/пути) — не секреты. Логин/пароль/путь к приватному ключу не пишутся в файл напрямую, а ссылаются на переменные окружения (раздел 3.2) по имени — так у секретов остаётся одно место хранения (`.env`), а не два независимых механизма. `ftp_handler.py` (раздел 3) при старте читает `ftp.yaml`, резолвит `*_env`-поля через `os.environ`.
+
+```yaml
+# /opt/cloudready-tasks/app/config/ftp.yaml
+profiles:
+
+  exchange-outgoing:                       # используется в примере раздела 5.3 (q.ftp)
+    protocol: sftp                         # ftp | ftps | sftp
+    host: win-filesrv.hennlich.local
+    port: 22
+    base_path: /outgoing
+    auth:
+      username: cloudready-ftp
+      password_env: FTP_EXCHANGE_OUTGOING_PASSWORD   # значение — в .env, не здесь
+    timeout_seconds: 30
+    max_connections: 2                     # ограничение параллельных подключений с одного профиля
+
+  exchange-incoming:
+    protocol: sftp
+    host: win-filesrv.hennlich.local
+    port: 22
+    base_path: /incoming
+    auth:
+      username: cloudready-ftp
+      password_env: FTP_EXCHANGE_OUTGOING_PASSWORD   # тот же аккаунт, разные base_path
+    timeout_seconds: 30
+
+  partner-aptive:                          # внешний партнёр (см. aricoma.md, "typ FTP")
+    protocol: ftps
+    host: ftp.aptive.example.com
+    port: 21
+    base_path: /
+    passive: true                          # актуально для ftp/ftps, для sftp игнорируется
+    auth:
+      username: hennlich_cz
+      password_env: FTP_PARTNER_APTIVE_PASSWORD
+    tls:
+      verify: true
+    timeout_seconds: 45
+```
+
+Соответствующие переменные в `.env`/`.env.example` (раздел 3.2, группа "FTP/SFTP-профили"):
+```bash
+FTP_EXCHANGE_OUTGOING_PASSWORD=changeme
+FTP_PARTNER_APTIVE_PASSWORD=changeme
+```
+
+Для SFTP-профилей с авторизацией по ключу вместо пароля: `auth.private_key_path: /app/config/ftp-keys/exchange.pem` (файл монтируется отдельным read-only volume в `worker`, права `600`) вместо `password_env`.
+
+`FTP_CONNECTION_ERROR`/`FTP_AUTH_ERROR` (раздел 6.5) — коды ошибок, которые `ftp_handler.py` возвращает, если профиль из этого файла не резолвится (сеть недоступна / неверные учётные данные).
+
 ---
 
 ## 3. Каркас репозитория (приложение)
@@ -234,6 +287,7 @@ services:
       - ./app/logs/worker:/app/logs
       - ./smb/exchange:/mnt/smb/exchange
       - ./smb/archive:/mnt/smb/archive
+      - ./app/config/ftp-keys:/app/config/ftp-keys:ro   # приватные ключи для SFTP-профилей с auth.private_key_path (раздел 2.1)
     deploy:
       replicas: ${WORKER_REPLICAS:-2}  # Worker Container(s) (1..N) — раздел 9, многоворкерная координация
     depends_on:
@@ -347,6 +401,10 @@ SERVICE_API_KEY=changeme-long-random-key
 # BC_OAUTH_TOKEN_URL=https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
 # JWT_JWKS_URL=https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys
 
+# ── FTP/SFTP-профили — раздел 2.1 (ftp.yaml ссылается на эти имена) ──
+FTP_EXCHANGE_OUTGOING_PASSWORD=changeme
+FTP_PARTNER_APTIVE_PASSWORD=changeme
+
 # ── Публичные адреса ────────────────────────────────────────
 PUBLIC_API_URL=https://cloudready.hennlich.local
 
@@ -357,7 +415,7 @@ RECONCILER_STALE_THRESHOLD_MINUTES=15               # порог для reconcil
 WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
 ```
 
-`ftp.yaml`/`printers.yaml` (раздел 2, `/opt/cloudready-tasks/app/config/`) хранятся на хосте отдельно от git и `.env` — сами по себе содержат учётные данные FTP/SFTP-профилей, но живут в bind-mount, не в репозитории, поэтому не нуждаются в дублировании через переменные окружения; относиться к ним как к секретам с теми же правами доступа (`600`/`640`), что и к `.env`.
+`ftp.yaml`/`printers.yaml` (раздел 2, `/opt/cloudready-tasks/app/config/`) хранятся на хосте отдельно от git и содержат только топологию подключений (host/port/протокол/пути) — сами учётные данные FTP/SFTP-профилей вынесены в `.env` и подставляются по имени переменной (`password_env`, раздел 2.1), а не дублируются в yaml. Права на `ftp.yaml` — `640`, как у конфигурации, не как у секрета напрямую, но каталог `app/config/` в целом не должен быть доступен на чтение кому попало.
 
 ---
 
