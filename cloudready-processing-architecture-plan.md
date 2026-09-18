@@ -13,7 +13,7 @@
 | Web Task Monitor | UI оператора: статусы, логи, health | статический/SPA фронтенд |
 | FastAPI Container | REST API, auth, интеграция с Business Central, WebSocket | Python / FastAPI |
 | RabbitMQ Container | брокер задач: очереди по типу, priority, TTL, retry, DLQ | RabbitMQ |
-| Worker Container(s) | исполнение задач: печать, конвертация, PDF, FTP/SFTP, workflow | Python (Celery/consumer) |
+| Worker Container(s) | исполнение задач: печать, конвертация, PDF, FTP/SFTP, workflow | Python / `aio-pika` (асинхронный consumer) |
 | Redis Container | locks, cache (task status, auth, BC data), Pub/Sub (WS notifications) | Redis |
 | PostgreSQL Container | источник истины: tasks, документы, логи, конфигурация, пользователи | PostgreSQL |
 | NST (Navision Service Tier) | print gateway: приём заданий, выбор принтера, печать через Windows spooler | внешний сервис (Business Central) |
@@ -82,10 +82,12 @@
 Монтирование SMB на хосте (`/etc/fstab`, пример):
 
 ```bash
-//WIN-FILESRV/exchange  /opt/cloudready-tasks/smb/exchange  cifs  credentials=/opt/cloudready-tasks/.smbcredentials,uid=1000,gid=1000,iocharset=utf8,vers=3.0  0  0
-//WIN-FILESRV/archive   /opt/cloudready-tasks/smb/archive   cifs  credentials=/opt/cloudready-tasks/.smbcredentials,uid=1000,gid=1000,iocharset=utf8,vers=3.0  0  0
-//WIN-FILESRV/shared    /opt/cloudready-tasks/smb/shared    cifs  credentials=/opt/cloudready-tasks/.smbcredentials,uid=1000,gid=1000,iocharset=utf8,vers=3.0  0  0
+//WIN-FILESRV/exchange  /opt/cloudready-tasks/smb/exchange  cifs  credentials=/opt/cloudready-tasks/.smbcredentials,uid=1000,gid=1000,iocharset=utf8,vers=3.0,soft,timeo=100,retry=1  0  0
+//WIN-FILESRV/archive   /opt/cloudready-tasks/smb/archive   cifs  credentials=/opt/cloudready-tasks/.smbcredentials,uid=1000,gid=1000,iocharset=utf8,vers=3.0,soft,timeo=100,retry=1  0  0
+//WIN-FILESRV/shared    /opt/cloudready-tasks/smb/shared    cifs  credentials=/opt/cloudready-tasks/.smbcredentials,uid=1000,gid=1000,iocharset=utf8,vers=3.0,soft,timeo=100,retry=1  0  0
 ```
+
+`soft,timeo=100,retry=1` — принципиально важные опции, не косметика: без них монтирование по умолчанию "hard" — при недоступности Windows-шары (перезагрузка файлового сервера, сетевой сбой) любой процесс воркера, обращающийся к `/mnt/smb/*`, зависает на I/O вместо быстрой ошибки, что блокирует весь воркер-процесс, а не только задачу, которая работает с архивом. С `soft` операция завершается по таймауту с ошибкой (`STORAGE_WRITE_ERROR`, раздел 6.5) — воркер обязан её ловить и уходить в retry по политике FTP/архивации, а не падать.
 
 ### 2.1 `ftp.yaml` — профили подключений (пример)
 
@@ -191,7 +193,7 @@ cloudready-tasks/
 │   │   ├── Dockerfile
 │   │   ├── pyproject.toml
 │   │   ├── worker/
-│   │   │   ├── main.py                  # consumer entrypoint (celery worker / aio-pika consumer)
+│   │   │   ├── main.py                  # consumer entrypoint (aio-pika, асинхронный, без Celery — см. примечание ниже)
 │   │   │   ├── dispatcher.py            # маршрутизация по routing key → handler
 │   │   │   ├── handlers/
 │   │   │   │   ├── print_handler.py     # NST client: submit print job, poll status
@@ -234,6 +236,8 @@ cloudready-tasks/
     └── grafana-dashboards/              # опционально, для Roles Summary → Observable
 ```
 
+**Почему `aio-pika`, а не Celery.** Celery несёт собственную модель задач, retry/backoff и планировщик (`beat`), которые частично дублируют то, что этот план и так реализует вручную поверх PostgreSQL: custom retry-политику по типам задач (раздел 7), outbox (раздел 4.1), проверку идемпотентности и `cancelled`-флага перед выполнением (раздел 5.1). Держать Celery и при этом не использовать большую часть его механизма ретраев — источник путаницы (два независимых места, отвечающих за повтор задачи). `aio-pika` — тонкий асинхронный AMQP-клиент без собственной модели задач: `dispatcher.py` и `handlers/*` полностью владеют логикой выполнения, а RabbitMQ используется как транспорт, а не как часть retry-фреймворка.
+
 ### 3.1 `docker-compose.yml` (пример)
 
 Раскладка сервисов на хост-структуру из раздела 2 и репозиторий из раздела 3. Порты RabbitMQ/Redis/PostgreSQL не публикуются наружу — только внутри `backend`-сети (раздел 8, "Сетевая изоляция"); наружу смотрят `api` (за reverse proxy) и `web-task-monitor`.
@@ -258,13 +262,16 @@ services:
       - ./app/templates:/app/templates:ro
       - ./app/config:/app/config:ro
       - ./app/logs/api:/app/logs
-    ports:
-      - "127.0.0.1:8000:8000"        # только на loopback, наружу — через reverse proxy на хосте
+    deploy:
+      replicas: ${API_REPLICAS:-2}   # падение одного процесса api не останавливает REST/WS целиком
     depends_on:
       postgres: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       redis: { condition: service_healthy }
     networks: [backend]
+    # без fixed host-порта: при replicas > 1 несколько контейнеров не могут шарить один и тот же
+    # 127.0.0.1:8000 на хосте — reverse proxy на хосте обращается к api:8000 через backend-сеть
+    # (Docker DNS балансирует между репликами), сам proxy слушает 127.0.0.1/443 наружу
 
   worker:
     build: ./services/worker
@@ -368,7 +375,34 @@ volumes:
     external: true
 ```
 
-`docker-compose.override.yml` (локальная разработка) добавляет `ports` для прямого доступа к `rabbitmq` (15672), `postgres` (5432), монтирует исходники в `api`/`worker` с `--reload`/hot-reload вместо собранного образа — не используется в проде.
+`docker-compose.override.yml` (локальная разработка) добавляет `ports` для прямого доступа к `rabbitmq` (15672), `postgres` (5432), монтирует исходники в `api`/`worker` с `--reload`/hot-reload вместо собранного образа — не используется в проде. Также фиксирует `replicas: 1` для `api`/`worker` независимо от значения `API_REPLICAS`/`WORKER_REPLICAS` в `.env` конкретного разработчика — на локальной машине незачем поднимать несколько реплик (лишний расход ресурсов, сложнее читать логи одного процесса и понимать, какой из N воркеров забрал сообщение), а override гарантирует единое поведение для всех, а не зависит от того, что у кого прописано в собственном `.env`:
+
+```yaml
+# docker-compose.override.yml
+services:
+  api:
+    deploy:
+      replicas: 1
+    ports:
+      - "8000:8000"                 # прямой доступ для разработки, без reverse proxy
+    volumes:
+      - ./services/api/app:/app/app # монтирование исходников поверх образа
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    deploy:
+      replicas: 1
+    volumes:
+      - ./services/worker/worker:/app/worker
+
+  rabbitmq:
+    ports:
+      - "15672:15672"               # management UI, недоступен в проде (раздел 8)
+
+  postgres:
+    ports:
+      - "5432:5432"                 # прямой доступ клиентом БД с хост-машины
+```
 
 ### 3.2 `.env.example`
 
@@ -414,6 +448,7 @@ DOCUMENT_RETENTION_DAYS=90                          # ops/retention/cleanup-docu
 LOCK_TTL_SECONDS=60                                 # базовый TTL Redis-лока перед продлением/heartbeat
 RECONCILER_STALE_THRESHOLD_MINUTES=15               # порог для reconciler зависших print_jobs
 WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
+API_REPLICAS=2                                      # FastAPI Container — без реплик api является SPOF для REST/WS (раздел 1)
 ```
 
 `ftp.yaml`/`printers.yaml` (раздел 2, `/opt/cloudready-tasks/app/config/`) хранятся на хосте отдельно от git и содержат только топологию подключений (host/port/протокол/пути) — сами учётные данные FTP/SFTP-профилей вынесены в `.env` и подставляются по имени переменной (`password_env`, раздел 2.1), а не дублируются в yaml. Права на `ftp.yaml` — `640`, как у конфигурации, не как у секрета напрямую, но каталог `app/config/` в целом не должен быть доступен на чтение кому попало.
@@ -549,6 +584,8 @@ WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
   "idempotency_key": "bc-po-2026-00114-generate-1"
 }
 ```
+
+**Экранирование данных шаблона.** `data` — внешний ввод, даже если он приходит от доверенного вызывающего (BC, раздел 8.1). "Доверенный источник" означает, что BC не пришлёт вредоносный файл или поддельный запрос — но не гарантирует, что *значения отдельных полей* (например, `customer` или произвольный текст в позиции заказа) не содержат управляющих символов Typst-разметки, введённых конечным пользователем на стороне BC. `pdf_handler.py` обязан подставлять значения `data` в шаблон через экранирование средствами Typst (или собственный слой экранирования до рендера), а не собирать markup конкатенацией строк — иначе поле, дошедшее из пользовательского ввода в BC, может сломать структуру документа или внедрить непредусмотренную Typst-разметку. Дополнительно — ограничение на глубину/размер `data` (например, максимальное число элементов `items`), чтобы один запрос не мог сгенерировать неограниченно большой PDF.
 
 Файл пишется воркером как `generated/{task_id}__invoice-INV-2026-000481.pdf` (временное имя + атомарный `rename` после успешного рендера), а не напрямую под `filename` из запроса — иначе повторный прогон (retry из раздела 7, до 2 попыток) может перезаписать файл первой попытки в момент, когда он уже используется на шаге печати workflow. `filename` в ответе задачи — то, что видит пользователь; физический путь на диске включает `task_id`.
 
@@ -859,6 +896,11 @@ Callback NST → API (изменение статуса задания печа�
 - **`ops/healthcheck/check-stack.sh`** проверяет: подключение к RabbitMQ (AMQP heartbeat), Redis (`PING`), PostgreSQL (`SELECT 1`), доступность NST (`GET /health` на Print Gateway, если есть). Разделение жёстких/мягких зависимостей: `GET /health/ready` (используется для вывода из балансировки) зависит только от RabbitMQ/Redis/PostgreSQL — недоступность NST не должна ронять весь API из readiness, иначе одновременно остановится и приём задач на конвертацию/генерацию PDF, которые от NST не зависят. Статус NST — отдельное поле `GET /health` (информационное, для System Health в Web Task Monitor), не влияющее на readiness-пробу.
 - **Многоворкерная координация**: при масштабировании `Worker Container(s)` на N реплик — `prefetch_count` на consumer ограничивает число параллельно взятых сообщений на инстанс; операции с общим ресурсом (запись в один файл, один и тот же принтер) защищены Redis-локом (`core/locks.py`). Фиксированный TTL без продления опасен в обе стороны: короткий TTL истекает раньше, чем реально завершится операция (второй воркер получает тот же лок, пока первый ещё работает — race, от которой лок должен защищать); длинный TTL надолго блокирует ресурс при падении воркера, держащего лок. Поэтому `locks.py` реализует продление (heartbeat каждые TTL/3 из отдельного потока/таска, пока операция выполняется) вместо однократной установки TTL "с запасом".
 - **Реконсиляция зависших print-заданий**: `print_handler.py` полагается на push-callback от NST (раздел 5.2), но сеть между NST и API может оборваться именно в момент отправки callback — задача физически напечатана, но система об этом не узнает и `task.status` останется в `running` навсегда. Отдельный периодический job (`reconciler`, часть `outbox-relay` или отдельный процесс) опрашивает `print_jobs` в статусе `received`/`printing` дольше настраиваемого порога (например, 15 минут) и запрашивает у NST актуальный статус по `nst_job_ref` напрямую, а не ждёт callback бесконечно.
+- **Структурированные логи**: `core/logging.py` (`api`/`worker`) пишет логи в JSON, не в plain text, с обязательными полями `task_id`/`workflow_task_id`/`nst_job_ref` (где применимо) в каждой строке. При N воркер-репликах и retry/backoff разбор "потерявшейся" задачи по логам без единого структурированного ключа означает grep по нескольким контейнерам и файлам вручную — дорого добавить постфактум, дёшево заложить сразу. Централизованный сбор логов (Loki/ELK) — не блокер для MVP (раздел 11), но структурированный формат должен быть с первой строчки кода, чтобы не переписывать логирование в проде задним числом.
+- **Принятые архитектурные допущения (single point of coordination).** Явно фиксируется как сознательный выбор для текущего масштаба (один завод/компания, не multi-tenant), а не как то, что забыто или отложено:
+  - **RabbitMQ/Redis/PostgreSQL — по одному инстансу**, без кластера/репликации. Падение хоста, диска или процесса любого из трёх останавливает весь конвейер задач целиком (печать, PDF, FTP — одновременно). Путь эволюции при росте нагрузки/критичности: RabbitMQ quorum-очереди на кластере из 3 узлов, PostgreSQL — потоковая репликация (`streaming replication`) с ручным/автоматическим failover, Redis — Sentinel. Это следующий этап после MVP, не часть плана раздела 11.
+  - **`api` и `worker` пишут в одну и ту же схему PostgreSQL напрямую** (shared database). Экономичный выбор для одной команды и одного репозитория миграций — `alembic` в `services/api` (раздел 3, чеклист п.3) остаётся единственным источником изменений схемы; `worker`/`reconciler`/`outbox-relay` только читают/пишут по уже существующим таблицам и не создают собственных миграций. Если в будущем появится больше независимых сервисов с доступом к БД — владение схемой нужно будет пересмотреть (например, выделить схему для каждого сервиса или перейти на API вместо прямого доступа к таблицам), но откладывать это ниже MVP оправданно при текущем размере команды.
+  - Оба допущения не требуют действий сейчас — они требуют, чтобы решение оставалось видимым (в этом разделе, не только в голове у автора плана) и пересматривалось при следующем существенном росте нагрузки или числа сервисов.
 
 ---
 
