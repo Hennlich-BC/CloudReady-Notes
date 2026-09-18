@@ -390,6 +390,7 @@ REDIS_PASSWORD=changeme-strong-password
 # ── NST (Navision Service Tier) — раздел 5.2 ───────────────
 NST_BASE_URL=https://nst.hennlich.local
 NST_CALLBACK_SECRET=changeme-hmac-secret            # подпись /internal/print-callback
+NST_CALLBACK_MAX_SKEW_SECONDS=300                   # допустимое расхождение timestamp в callback, защита от replay (раздел 5.2)
 NST_DOCUMENT_TOKEN_TTL_SECONDS=1800                 # TTL токена document_url, см. оговорку в разделе 5.2
 
 # ── Auth — раздел 8 ─────────────────────────────────────────
@@ -452,6 +453,10 @@ WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
 
 ### 5.1 FastAPI Container — REST API
 
+**Идемпотентность на уровне API.** `idempotency_key` — опциональное поле в теле **любого** `POST /api/v1/tasks/*` (`print`, `generate`, `convert`, `workflow`), не только у печати. Смысл — на уровне API, а не воркера: `task_id` каждый раз новый, поэтому проверка идемпотентности в `print_handler.py`/`ftp_handler.py`/… (раздел 4.1) защищает только от повторной *доставки* одного и того же сообщения RabbitMQ, но не от повторного *создания* задачи — например, при retry HTTP-запроса на стороне BC из-за таймаута сети, пока первая задача уже была создана и выполняется. Без `idempotency_key` на уровне API такой повтор создаёт вторую независимую задачу (второй PDF, второй запуск workflow), и защита в разделе 4.1 её не поймает, потому что это два разных `task_id`, оба валидных с точки зрения воркера.
+
+Реализация: `idempotency_key` — уникальный индекс в таблице `tasks` (раздел 10, alembic-миграции). Если задача с таким ключом уже существует, `POST /tasks/*` возвращает `200 OK` с уже существующим `task_id` вместо создания дубликата и `202 Accepted`. Ключ уникален в пределах типа задачи (`type` + `idempotency_key`), не глобально — одно и то же бизнес-событие может законно порождать, например, и `print`, и `ftp`-задачу с похожим ключом.
+
 #### `POST /api/v1/tasks/print` — создать задание печати
 
 Запрос:
@@ -476,7 +481,7 @@ WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
 }
 ```
 
-`priority`: целое `0–10` (соответствует `x-max-priority` очереди), по умолчанию `5`. `idempotency_key` — опционален; если задача с таким ключом уже существует, API возвращает существующий `task_id` вместо создания дубликата (защита от повторной отправки при retry на стороне клиента/BC).
+`priority`: целое `0–10` (соответствует `x-max-priority` очереди), по умолчанию `5`. `idempotency_key` — см. общее правило в начале раздела 5.1; для печати особенно важен, так как повторная задача означает физически второй отпечаток документа.
 
 Ответ `202 Accepted`:
 ```json
@@ -509,6 +514,8 @@ WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
 
 #### `POST /api/v1/documents` — загрузить внешний файл на печать (без генерации через Typst)
 
+Только для запросов, аутентифицированных как Business Central (раздел 8.1) — единственный источник входящих файлов. `SERVICE_API_KEY` сторонних систем такого доступа не имеет.
+
 `multipart/form-data`: поле `file` (PDF/DOCX/…). Ответ `201 Created`:
 ```json
 {
@@ -538,7 +545,8 @@ WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
     "filename": "invoice-INV-2026-000481.pdf",
     "store_to": "/app/data/documents/generated"
   },
-  "priority": 3
+  "priority": 3,
+  "idempotency_key": "bc-po-2026-00114-generate-1"
 }
 ```
 
@@ -614,7 +622,8 @@ WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
 {
   "document": { "source": "uploaded", "reference": "doc_e51fa2", "format": "docx" },
   "target_format": "pdf",
-  "priority": 4
+  "priority": 4,
+  "idempotency_key": "bc-po-2026-00114-convert-1"
 }
 ```
 
@@ -640,7 +649,8 @@ WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
     "printer_id": "office-printer-01",
     "archive_profile": "exchange-outgoing"
   },
-  "priority": 5
+  "priority": 5,
+  "idempotency_key": "bc-po-2026-00114-workflow-1"
 }
 ```
 
@@ -718,9 +728,16 @@ Callback NST → API (изменение статуса задания печа�
   "job_id": "t_7c1e9a3b",
   "status": "printed",
   "printed_at": "2026-09-10T09:14:40Z",
-  "pages": 1
+  "pages": 1,
+  "timestamp": "2026-09-10T09:14:40Z"
 }
 ```
+
+**Защита от replay-атаки.** HMAC-подпись сама по себе подтверждает только то, что тело запроса не изменено — она не мешает повторно отправить ранее перехваченный, полностью валидный запрос (например, снова прислать уже принятый callback `status: printed` для того же `job_id`, что не критично само по себе, но подтверждает, что канал не защищён от воспроизведения произвольного старого сообщения). Поэтому `/internal/print-callback`:
+- проверяет `timestamp` из тела запроса: отклоняет запрос, если он старше окна допустимости (например, ±5 минут от текущего времени сервера) — `NST_CALLBACK_MAX_SKEW_SECONDS` в `.env` (раздел 3.2);
+- `timestamp` входит в подписываемые HMAC-данные (`HMAC-SHA256(body, NST_CALLBACK_SECRET)`, где `body` включает поле `timestamp`) — иначе атакующий может просто подставить свежий `timestamp` к перехваченному телу и подпись не поменяется;
+- сравнение подписи выполняется constant-time-функцией (`hmac.compare_digest` в Python), а не оператором `==` — иначе появляется теоретическая возможность подобрать подпись через тайминг-атаку;
+- повторный callback с тем же `nst_job_ref` и тем же `status` в пределах окна допустимости — не ошибка (сеть могла продублировать доставку), обрабатывается идемпотентно (раздел 4.1): статус просто переустанавливается в то же значение, без повторных побочных эффектов.
 
 Связь статусов: `task.status` не приравнивается к `print_job.status` напрямую. Задача переходит в `success`, когда `print_job.status = printed`; переходит в `failed` при `print_job.status = failed`. Промежуточные статусы NST (`received`, `queued`, `printing`) отображаются в `task.status = running` — детали видны в `print_jobs.status` отдельно, чтобы не терять информацию при агрегации.
 
@@ -822,11 +839,19 @@ Callback NST → API (изменение статуса задания печа�
 
 ## 8. Безопасность
 
-- **Аутентификация API**: JWT, выданный на основе учётных данных Business Central (OAuth2 client credentials от NST/BC для серверных вызовов; пользовательский JWT — для Web Client/Mobile App через BC). Для сторонних систем (`External System (3rd party)`) — отдельные API-ключи с ограниченным набором прав (только `POST /tasks/print`, `POST /documents`).
-- **Callback от NST** (`/internal/print-callback`) — подписывается `X-Signature` (HMAC), секрет — в `.env` (`NST_CALLBACK_SECRET`), не в git.
+- **Аутентификация API**: JWT, выданный на основе учётных данных Business Central (OAuth2 client credentials от NST/BC для серверных вызовов; пользовательский JWT — для Web Client/Mobile App через BC). Для сторонних систем (`External System (3rd party)`) — отдельные API-ключи с ограниченным набором прав; `POST /documents` и любой путь `"source": "uploaded"` в теле задачи в этот набор не входят — единственный источник входящих файлов — BC (раздел 8.1).
+- **Callback от NST** (`/internal/print-callback`) — подписывается `X-Signature` (HMAC), секрет — в `.env` (`NST_CALLBACK_SECRET`), не в git. Подпись покрывает и `timestamp` из тела запроса, который проверяется на допустимое расхождение (`NST_CALLBACK_MAX_SKEW_SECONDS`) — защита от replay-атаки повторной отправкой перехваченного валидного запроса (детали — раздел 5.2). Сравнение подписи — constant-time (`hmac.compare_digest`).
 - **Сетевая изоляция**: RabbitMQ (5672/15672), Redis (6379), PostgreSQL (5432) не публикуются наружу — доступны только внутри docker-сети `docker-compose.yml`. Наружу смотрят только FastAPI (443 через reverse proxy) и Web Task Monitor.
 - **RBAC на уровне API**: минимум две роли — `operator` (Web Task Monitor: просмотр, retry, cancel) и `service` (создание задач от BC/3rd party). Хранится в таблице `users`/`permissions` (PostgreSQL, см. чеклист п.7).
 - **Секреты**: `.env` на хосте, права `600`, не коммитится (`.gitignore`); ротация паролей RabbitMQ/Redis/PostgreSQL — вручную по регламенту, отдельным пунктом не автоматизируется на первом этапе.
+
+### 8.1 Модель доверия к файлам
+
+Единственный источник входящих файлов — **Business Central**. `POST /api/v1/documents` (загрузка внешнего файла на печать, раздел 5.1) принимает запросы только с аутентификацией BC (JWT, выданный по BC OAuth client credentials). `SERVICE_API_KEY` для `External System (3rd party)` не даёт доступа ни к `POST /documents`, ни к `"document": {"source": "uploaded", ...}` в теле `/tasks/print`/`/tasks/convert` — сторонние системы такого пути не имеют в принципе, значит нет входящих файлов, для которых нужна отдельная поверхность валидации (лимиты размера, MIME/magic-bytes, sandbox для конвертации, антивирус) — файлы приходят из одного доверенного источника, BC, и обрабатываются как есть.
+
+Что у `External System (3rd party)` остаётся в рамках `SERVICE_API_KEY` (см. `ftp.yaml`, профиль `partner-aptive`) — это **исходящий** FTP (`ftp_handler.py` отправляет уже сгенерированный/находящийся в системе файл наружу), не входящий канал для файлов; путь traversal-проверки на `local_path`/`remote_path` (см. разбор безопасности, п.4) при этом остаются в силе — они защищают не от недоверенного файла, а от того, что сам путь в задаче не выйдет за пределы разрешённой директории.
+
+Разграничение — по способу аутентификации конкретного запроса (BC-JWT vs `SERVICE_API_KEY`), не по полю `metadata`/`source` в теле запроса, которое заполняет сам вызывающий и которому нельзя доверять для целей авторизации.
 
 ## 9. Эксплуатация
 
@@ -841,10 +866,10 @@ Callback NST → API (изменение статуса задания печа�
 
 1. `infra/rabbitmq/definitions.json` — описать exchange/queues/DLQ, поднять RabbitMQ Container с импортом топологии при старте.
 2. `libs/common/statuses.py` — enum'ы статусов (раздел 6) как единый источник правды для api и worker.
-3. Alembic-миграции: таблицы `tasks` (с `payload` JSONB, раздел 4.1), `tasks_outbox`, `workflow_steps`, `print_jobs`, `documents`, `printers`, `users`, `permissions`, `workflow_history` (роли `operator`/`service` — раздел 8).
+3. Alembic-миграции: таблицы `tasks` (с `payload` JSONB, раздел 4.1, и уникальным индексом `(type, idempotency_key)` — раздел 5.1), `tasks_outbox`, `workflow_steps`, `print_jobs`, `documents`, `printers`, `users`, `permissions`, `workflow_history` (роли `operator`/`service` — раздел 8).
 4. `services/api` — CRUD задач + `cancel`/`retry` (из `tasks.payload`), `POST /documents` (upload), auth (JWT от BC + API-ключи для 3rd party), `mq_publisher.py` + outbox-relay (раздел 4.1), `cache.py` (Redis), health-эндпоинты (жёсткие vs мягкие зависимости, раздел 9).
 5. `services/worker` — `dispatcher.py` (с проверкой `cancelled` перед выполнением) + handlers по одному на тип задачи (со своей retry-политикой, раздел 7, и проверкой идемпотентности перед внешним побочным эффектом — раздел 4.1), `locks.py` (Redis locks с продлением/heartbeat, раздел 9) для конкурентных операций.
-6. Интеграция NST client (`nst_client.py`) — submit с проверкой идемпотентности по `print_jobs.nst_job_ref` + callback endpoint в API (`/internal/print-callback`) с проверкой HMAC-подписи; адресация через реальный сетевой hostname API, не docker-internal DNS (раздел 5.2); отдельный `reconciler` для зависших `print_jobs` без callback (раздел 9).
+6. Интеграция NST client (`nst_client.py`) — submit с проверкой идемпотентности по `print_jobs.nst_job_ref` + callback endpoint в API (`/internal/print-callback`) с проверкой HMAC-подписи (включая `timestamp` и окно `NST_CALLBACK_MAX_SKEW_SECONDS`, constant-time сравнение — раздел 5.2/8) и защитой от replay; адресация через реальный сетевой hostname API, не docker-internal DNS (раздел 5.2); отдельный `reconciler` для зависших `print_jobs` без callback (раздел 9).
 7. `services/web-task-monitor` — Dashboard/TaskList/TaskDetails (+ retry/cancel из UI) на базе REST + WS.
 8. `ops/healthcheck/check-stack.sh` — проверка RabbitMQ/Redis/PostgreSQL/NST доступности для System Health.
 9. Настроить `x-dead-letter-exchange` и алерт на непустую `q.dead_letter` (Observable из Roles Summary).
