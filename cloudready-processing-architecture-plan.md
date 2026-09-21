@@ -309,7 +309,7 @@ services:
     environment:
       API_BASE_URL: ${PUBLIC_API_URL}
     ports:
-      - "127.0.0.1:8080:80"
+      - "127.0.0.1:${WEB_MONITOR_PORT:-8080}:80"
     depends_on: [api]
     networks: [backend]
 
@@ -384,9 +384,9 @@ services:
     deploy:
       replicas: 1
     ports:
-      - "8000:8000"                 # прямой доступ для разработки, без reverse proxy
+      - "${DEV_API_PORT:-8000}:8000"          # прямой доступ для разработки, без reverse proxy
     volumes:
-      - ./services/api/app:/app/app # монтирование исходников поверх образа
+      - ./services/api/app:/app/app           # монтирование исходников поверх образа
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   worker:
@@ -397,12 +397,14 @@ services:
 
   rabbitmq:
     ports:
-      - "15672:15672"               # management UI, недоступен в проде (раздел 8)
+      - "${DEV_RABBITMQ_MGMT_PORT:-15672}:15672"   # management UI, недоступен в проде (раздел 8)
 
   postgres:
     ports:
-      - "5432:5432"                 # прямой доступ клиентом БД с хост-машины
+      - "${DEV_POSTGRES_PORT:-5432}:5432"          # прямой доступ клиентом БД с хост-машины
 ```
+
+Порты вынесены в переменные окружения (`.env`, раздел 3.2), а не захардкожены в `override`-файле, по той же причине, что и `*_REPLICAS`: у нескольких разработчиков на одной машине (или при уже занятом `5432` локальным Postgres) фиксированные значения конфликтуют — правится значением в своём `.env`, а не редактированием закоммиченного `docker-compose.override.yml`. Значение по умолчанию (`:-8000` и т.д.) сохраняет поведение "работает из коробки", если переменные не заданы явно.
 
 ### 3.2 `.env.example`
 
@@ -442,6 +444,7 @@ FTP_PARTNER_APTIVE_PASSWORD=changeme
 
 # ── Публичные адреса ────────────────────────────────────────
 PUBLIC_API_URL=https://cloudready.hennlich.local
+WEB_MONITOR_PORT=8080                               # порт Web Task Monitor на loopback хоста (раздел 3.1)
 
 # ── Эксплуатация — раздел 9 ─────────────────────────────────
 DOCUMENT_RETENTION_DAYS=90                          # ops/retention/cleanup-documents.sh
@@ -449,6 +452,14 @@ LOCK_TTL_SECONDS=60                                 # базовый TTL Redis-�
 RECONCILER_STALE_THRESHOLD_MINUTES=15               # порог для reconciler зависших print_jobs
 WORKER_REPLICAS=2                                   # Worker Container(s) (1..N)
 API_REPLICAS=2                                      # FastAPI Container — без реплик api является SPOF для REST/WS (раздел 1)
+
+# ── Локальная разработка — раздел 3.1 (docker-compose.override.yml) ──
+# Не используются в проде (override-файл там не деплоится). Дефолты в override
+# совпадают со значениями ниже — переменные нужны только чтобы поменять порт
+# на конкретной машине разработчика (например, при конфликте с локальным Postgres).
+DEV_API_PORT=8000
+DEV_RABBITMQ_MGMT_PORT=15672
+DEV_POSTGRES_PORT=5432
 ```
 
 `ftp.yaml`/`printers.yaml` (раздел 2, `/opt/cloudready-tasks/app/config/`) хранятся на хосте отдельно от git и содержат только топологию подключений (host/port/протокол/пути) — сами учётные данные FTP/SFTP-профилей вынесены в `.env` и подставляются по имени переменной (`password_env`, раздел 2.1), а не дублируются в yaml. Права на `ftp.yaml` — `640`, как у конфигурации, не как у секрета напрямую, но каталог `app/config/` в целом не должен быть доступен на чтение кому попало.
