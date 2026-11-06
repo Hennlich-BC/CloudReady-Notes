@@ -1,39 +1,48 @@
-# API — aktuální stav (BC Gateway)
+# API (cloudready) — aktuální stav (BC Gateway)
 
-Datum: 05.11.2026
-Zdroje: `api-infrastructure-cs.md` (cílová architektura a seznam scénářů) a `README_bc_get_away.md` (implementované MVP M1–M9).
-
-> Podle obsahu popisuje `api-infrastructure-cs.md` cílový stav („co delegovat“, „doporučený stack“), zatímco README popisuje to, co je již sestaveno a funguje. Proto je níže `api-infrastructure` brán jako 100 % rozsahu a README jako skutečný stav plnění.
+Datum: 05.11.2026–06.11.2026
 
 ## Souhrnná statistika
 
-| Oblast | Počet bodů | Hotovo |
-|---|---|---|
-| Obchodní scénáře pro delegování do REST API | 12 | **≈ 9 %** |
-| Společné požadavky na REST API | 6 | **65 %** |
-| Komponenty stacku Docker Compose | 10 | **40 %** |
-| Infrastruktura a provoz | 7 | **75 %** |
-| Minimální první verze (5 služeb) | 5 | **60 %** (3 z 5) |
-| **Celkem (průměr čtyř hlavních oblastí)** | | **≈ 47 %** |
+| Oblast | Hotovo |
+|---|---|
+| Obchodní scénáře pro delegování do REST API | **≈ 8 %** |
+| Společné požadavky na REST API | **65 %** |
+| Komponenty stacku Docker Compose | **40 %** |
+| Infrastruktura a provoz | **75 %** |
+| Minimální první verze (5 služeb) | **60 %** (3 z 5) |
+| **Celkem (průměr čtyř hlavních oblastí)** | **≈ 47 %** |
 
-Stručně: platforma (fronta, databáze, outbox, API, retry/DLQ, monitoring, backup) je postavena dobře a pokrývá většinu infrastrukturních požadavků. Z obchodních scénářů reálně funguje pouze FTP/SFTP; PDF, tisk, přepravci, FinStat a SQL/HPL zatím nejsou zahájeny.
+Stručně: platforma (fronta, databáze, outbox, API, retry/DLQ, monitoring, backup) je postavena dobře a pokrývá většinu infrastrukturních požadavků. Z obchodních scénářů reálně funguje pouze FTP/SFTP; PDF, tisk, přepravci, FinStat a SQL zatím nejsou zahájeny.
 
-## 1. Obchodní scénáře (≈ 9 %)
+### Souhrnná statistika — stav dokončení
+
+![Souhrnná statistika stavu dokončení](images/api-current-state-readiness.png)
+
+## 1. Obchodní scénáře (≈ 8 %)
 
 | Scénář | Hotovo | Co je / co chybí |
 |---|---|---|
 | FTP/SFTP a SafeQueFile | 80 % | Je: FTP/FTPS/SFTP upload, list, download (podle názvu nebo masky), move, retry s backoff, idempotence, DLQ, ruční retry, profily v `ftp.yaml`. Chybí: pravidelný polling adresářů/front podle plánu, automatická archivace, samostatná podpora SafeQueFile. |
-| EDI, SKF, Škoda Auto, Eračun | 15 % | Je: přenos EDI souborů přes FTP profily `FTP-GMORS-DESADV` / `FTP-GMORS-ORDRSP`. Chybí: AS2, podpis/šifrování, validace XSD, transformace formátů. |
-| PDF štítky a serverové tiskárny | 10 % | Je: plán M10 (SMB/CUPS backendy, společný print job) a diagnostický skript `test-vprint-connection.py`. Chybí: implementace tisku a Print Agent. |
+| Tisk na běžné tiskárně | 10 % | Tisk byl otestován pouze v režimu SMB; je k dispozici diagnostický skript `test-vprint-connection.py`. Tisk přes CUPS ani Print Agent nebyl ověřen. |
+| Tisk PDF | 10 % | Je: architektura společného print jobu a varianty odeslání PDF přes CUPS nebo Print Agent. Chybí: implementovaný handler pro tisk PDF. |
+| Tisk dat Base64 | 0 % | Chybí: příjem a validace Base64, dekódování obsahu do dokumentu a předání výsledku do tiskového subsystému. |
+| Tisk čárových kódů na tiskárnách Zebra | 0 % | Chybí: generování příkazů ZPL, profily tiskáren Zebra a odesílání printer-ready dat do zařízení. |
 | Slučování PDF | 0 % | — |
 | PDF Template Management | 0 % | — |
-| Čárové kódy | 0 % | — |
-| SQL management a HPL skladové zásoby | 0 % | — |
+| EDI, SKF, Škoda Auto, Eračun | 15 % | Je: přenos EDI souborů přes FTP profily `FTP-GMORS-DESADV` / `FTP-GMORS-ORDRSP`. Chybí: AS2, podpis/šifrování, validace XSD, transformace formátů. |
+| SQL management a skladové zásoby | 0 % | — |
 | FinStat | 0 % | — |
 | Přepravci (GLS/DPD/GEIS/TNT/FedEx) | 0 % | — |
 | NCH | 0 % | Bude možné znovu využít FTP přenos. |
 | Obrázky na čtečkách | 0 % | — |
 | WebService Management (gateway) | 0 % | — |
+
+> **Samostatná infrastrukturní otázka tisku.** Je nutné posoudit přechod z otestovaného režimu SMB na CUPS provozovaný na samostatné VM. Přístup k této VM a tiskárnám musí být izolován na síťové úrovni a povolen pouze komponentám API/worker a administrátorským uzlům.
+
+![Současné a cílové řešení tisku](images/api-current-state-printing.png)
+
+> **Důležité omezení SMB.** Současný režim SMB umožňuje potvrdit předání úlohy do sdílené fronty, neposkytuje však úplné end-to-end sledování jejího provedení. Úspěšné odeslání nezaručuje, že tiskárna úlohu přijala, dokončila tisk a fyzicky vytiskla dokument.
 
 ## 2. Společné požadavky na REST API (65 %)
 
@@ -50,7 +59,7 @@ Stručně: platforma (fronta, databáze, outbox, API, retry/DLQ, monitoring, bac
 
 | Služba | Cíl | Hotovo | Komentář |
 |---|---|---|---|
-| api | FastAPI, Uvicorn, Pydantic | 100 % | M5, navíc Swagger UI. |
+| api | FastAPI, Uvicorn, Pydantic | 100 % | Implementováno včetně Swagger UI. |
 | rabbitmq | Spolehlivá fronta | 100 % | Durable topologie, `tasks.direct`, DLX, priority, TTL 7 dní. |
 | postgres | SQLAlchemy, Alembic | 100 % | Modely v `bc_gateway_core`, migrace přes `migrator`. |
 | redis (volitelně) | Cache tokenů, rate limiting, zámky | 50 % | Nasazen, ale používá se pro Pub/Sub WebSocketu, ne pro cache/rate limiting. |
@@ -66,7 +75,7 @@ Stručně: platforma (fronta, databáze, outbox, API, retry/DLQ, monitoring, bac
 | Požadavek | Hotovo | Komentář |
 |---|---|---|
 | Samostatný Linux server, Docker Engine + Compose | 100 % | Stack běží na samostatném SSH serveru. |
-| Backup databáze | 100 % | `make backup-postgres` s kontrolou `pg_restore --list` a retencí (M9). |
+| Backup databáze | 100 % | `make backup-postgres` s kontrolou `pg_restore --list` a politikou uchovávání záloh. |
 | Healthchecks | 100 % | `make health`: PostgreSQL, Redis, RabbitMQ, readiness API, DLQ, exit kódy pro monitoring. |
 | Rotace logů | 100 % | Logging driver `local` s limity, konfigurace logrotate. |
 | Pojmenované volumes | 75 % | Jsou pro PostgreSQL, RabbitMQ, Redis a dokumenty. Chybí `typst_templates` (Typst zatím není nasazen). |
@@ -77,6 +86,12 @@ Stručně: platforma (fronta, databáze, outbox, API, retry/DLQ, monitoring, bac
 
 | Oblast | Prvek | Hotovo |
 |---|---|---|
+| Integrace | FTP / FTPS / SFTP | 80 % |
+| Zpracování | tisk na běžné tiskárně (otestováno pouze SMB) | 10 % |
+| Zpracování | tisk PDF | 10 % |
+| Zpracování | tisk dat Base64 | 0 % |
+| Zpracování | tisk čárových kódů na tiskárnách Zebra | 0 % |
+| Zpracování | worker-documents (Typst / pikepdf) | 0 % |
 | Vstup | reverse-proxy (Nginx) | 0 % |
 | Vstup | HTTPS / OAuth 2.0 | 30 % |
 | Jádro | FastAPI | 100 % |
@@ -84,12 +99,9 @@ Stručně: platforma (fronta, databáze, outbox, API, retry/DLQ, monitoring, bac
 | Jádro | RabbitMQ (q.ftp, DLX, q.dead_letter) | 100 % |
 | Jádro | Redis (Pub/Sub stavů) | 50 % |
 | Zpracování | worker-integrations | 30 % |
-| Zpracování | worker-documents (Typst / pikepdf) | 0 % |
-| Zpracování | tisk (M10) | 10 % |
 | Zpracování | scheduler | 0 % |
-| Integrace | FTP / FTPS / SFTP | 80 % |
 | Integrace | EDI (SKF, Škoda Auto, Eračun) | 15 % |
-| Integrace | přepravci / FinStat / NCH / SQL-HPL | 0 % |
+| Integrace | přepravci / FinStat / NCH / SQL | 0 % |
 | Úložiště | volumes | 75 % |
 | Úložiště | MinIO | 0 % |
 | Provoz | observability | 20 % |
@@ -97,4 +109,64 @@ Stručně: platforma (fronta, databáze, outbox, API, retry/DLQ, monitoring, bac
 | Provoz | healthchecks | 100 % |
 | Provoz | rotace logů | 100 % |
 | Provoz | TLS certifikát | 0 % |
-| **Celkem** | scénáře ≈ 9 % · požadavky 65 % · komponenty 40 % · infrastruktura 75 % | **≈ 47 %** |
+| **Celkem** | scénáře ≈ 8 % · požadavky 65 % · komponenty 40 % · infrastruktura 75 % | **≈ 47 %** |
+
+## Seznam zkratek
+
+### Platforma a vývoj
+
+| Zkratka | Význam |
+|---|---|
+| AL | Application Language — jazyk pro vývoj rozšíření Microsoft Dynamics 365 Business Central. |
+| API | Application Programming Interface — aplikační programové rozhraní. |
+| BC | Microsoft Dynamics 365 Business Central. |
+| DB | Database — databáze. |
+| ID | Identifier — jedinečný identifikátor. |
+| MVP | Minimum Viable Product — minimální životaschopný produkt. |
+| OTel | OpenTelemetry — sada standardů a nástrojů pro telemetrii. |
+| REST | Representational State Transfer — architektonický styl pro tvorbu webových API. |
+| VM | Virtual Machine — virtuální stroj. |
+
+### Síťové protokoly a zabezpečení
+
+| Zkratka | Význam |
+|---|---|
+| AS2 | Applicability Statement 2 — protokol pro zabezpečenou výměnu obchodních dokumentů přes internet. |
+| FTP | File Transfer Protocol — protokol pro přenos souborů. |
+| FTPS | FTP over TLS — protokol FTP zabezpečený pomocí TLS. |
+| HTTPS | Hypertext Transfer Protocol Secure — zabezpečený protokol HTTP. |
+| OAuth 2.0 | Open Authorization 2.0 — standard delegované autorizace. |
+| SFTP | SSH File Transfer Protocol — zabezpečený protokol pro přenos souborů přes SSH. |
+| SMB | Server Message Block — protokol pro sdílený přístup k souborům a tiskárnám. |
+| SOAP | Simple Object Access Protocol — protokol pro výměnu strukturovaných zpráv webových služeb. |
+| TLS | Transport Layer Security — protokol pro zabezpečení síťového spojení. |
+
+### Fronty a úložiště
+
+| Zkratka | Význam |
+|---|---|
+| AMQP | Advanced Message Queuing Protocol — protokol pro výměnu zpráv. |
+| DLQ | Dead Letter Queue — fronta zpráv, které se nepodařilo zpracovat. |
+| DLX | Dead Letter Exchange — RabbitMQ exchange pro přesměrování nezpracovaných zpráv. |
+| S3 | Simple Storage Service — rozhraní objektového úložiště kompatibilní s S3. |
+| TTL | Time to Live — doba platnosti zprávy nebo dat. |
+
+### Dokumenty, data a tisk
+
+| Zkratka | Význam |
+|---|---|
+| Base64 | Způsob reprezentace binárních dat jako textového řetězce. |
+| CUPS | Common UNIX Printing System — tiskový systém pro operační systémy typu Unix. |
+| PDF | Portable Document Format — formát elektronických dokumentů. |
+| SQL | Structured Query Language — jazyk strukturovaných dotazů pro databáze. |
+| XML | Extensible Markup Language — rozšiřitelný značkovací jazyk. |
+| XSD | XML Schema Definition — jazyk pro popis struktury a pravidel XML dokumentu. |
+| ZPL | Zebra Programming Language — příkazový jazyk pro tiskárny Zebra. |
+
+### Doménové systémy a integrace
+
+| Zkratka | Význam |
+|---|---|
+| EDI | Electronic Data Interchange — elektronická výměna dat a obchodních dokumentů. |
+| NCH | Interní označení integrace skladových a celních operací; úplný význam není ve zdrojových materiálech uveden. |
+| SKF | Svenska Kullagerfabriken — společnost SKF; v dokumentu označuje EDI integraci s tímto obchodním partnerem. |
